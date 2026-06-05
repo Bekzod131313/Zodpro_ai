@@ -23,7 +23,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== SOZLAMALAR ====================
-BOT_TOKEN = os.getenv("BOT_TOKEN", ""8918826829:AAGoTikt8LYIfys8mWjixizR0Td_DtaHQac"")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8918826829:AAGoTikt8LYIfys8mWjixizR0Td_DtaHQac")
 ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "716768405").split(",")))
 
 # Guruh turlari
