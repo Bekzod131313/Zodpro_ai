@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
-"""
-Otaplama Biznesi - Telegram Bot
-Zakazlar | Prixodlar | Kassa | Ishchilar Reytingi
-"""
-
 import logging
 import re
-import json
 import os
+import sqlite3
 from datetime import datetime, date
+from typing import Optional, Dict, List
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
 )
-from database import Database
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -22,496 +17,407 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== SOZLAMALAR ====================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8918826829:AAGoTikt8LYIfys8mWjixizR0Td_DtaHQac")
-ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "716768405").split(",")))
+BOT_TOKEN = "8918826829:AAGoTikt8LYIfys8mWjixizR0Td_DtaHQac"
+ADMIN_IDS = [716768405]
+DB_PATH = "otaplama.db"
 
-# Guruh turlari
-GROUP_TYPES = {
-    "zakazlar": "📦 Zakazlar guruhi",
-    "prixodlar": "💰 Prixodlar guruhi",
-    "kassa": "🏦 Kassa guruhi",
-    "ishchilar": "⭐ Ishchilar guruhi",
-}
+# ===================== DATABASE =====================
 
-db = Database("otaplama.db")
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
+def init_db():
+    with get_conn() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS guruhlar (
+                chat_id INTEGER PRIMARY KEY,
+                tur TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS zakazlar (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                mijoz TEXT NOT NULL,
+                summa REAL NOT NULL,
+                obyekt TEXT DEFAULT '-',
+                holat TEXT DEFAULT 'faol',
+                qoshgan TEXT,
+                qoshildi TEXT DEFAULT CURRENT_TIMESTAMP,
+                yopildi TEXT
+            );
+            CREATE TABLE IF NOT EXISTS prixodlar (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                postavshik TEXT NOT NULL,
+                summa REAL NOT NULL,
+                izoh TEXT DEFAULT '-',
+                qoshgan TEXT,
+                qoshildi TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS kassa (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                tur TEXT NOT NULL,
+                kim TEXT NOT NULL,
+                summa REAL NOT NULL,
+                izoh TEXT DEFAULT '-',
+                qoshgan TEXT,
+                qoshildi TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS balllar (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                ball INTEGER NOT NULL,
+                sabab TEXT DEFAULT '-',
+                admin TEXT,
+                qoshildi TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        conn.commit()
 
-# ==================== YORDAMCHI FUNKSIYALAR ====================
+def set_group_type(chat_id, tur):
+    with get_conn() as conn:
+        conn.execute("INSERT OR REPLACE INTO guruhlar (chat_id, tur) VALUES (?, ?)", (chat_id, tur))
+        conn.commit()
 
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+def get_group_type(chat_id):
+    with get_conn() as conn:
+        row = conn.execute("SELECT tur FROM guruhlar WHERE chat_id = ?", (chat_id,)).fetchone()
+        return row["tur"] if row else None
 
-def format_money(amount: float) -> str:
-    return f"{amount:,.0f} so'm"
+def add_zakaz(chat_id, mijoz, summa, obyekt, qoshgan):
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO zakazlar (chat_id, mijoz, summa, obyekt, qoshgan) VALUES (?, ?, ?, ?, ?)",
+            (chat_id, mijoz, summa, obyekt, qoshgan)
+        )
+        conn.commit()
+        return cur.lastrowid
 
-def now_str() -> str:
-    return datetime.now().strftime("%d.%m.%Y %H:%M")
+def close_zakaz(chat_id, mijoz):
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM zakazlar WHERE chat_id=? AND holat='faol' AND LOWER(mijoz) LIKE LOWER(?) ORDER BY qoshildi DESC LIMIT 1",
+            (chat_id, f"%{mijoz}%")
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute("UPDATE zakazlar SET holat='yopilgan', yopildi=? WHERE id=?",
+                     (datetime.now().isoformat(), row["id"]))
+        conn.commit()
+        return dict(row)
 
-def today_str() -> str:
-    return date.today().strftime("%d.%m.%Y")
+def get_zakaz_stats(chat_id):
+    with get_conn() as conn:
+        faol = conn.execute("SELECT COUNT(*) as c FROM zakazlar WHERE chat_id=? AND holat='faol'", (chat_id,)).fetchone()["c"]
+        yopilgan = conn.execute("SELECT COUNT(*) as c FROM zakazlar WHERE chat_id=? AND holat='yopilgan'", (chat_id,)).fetchone()["c"]
+        summa = conn.execute("SELECT COALESCE(SUM(summa),0) as s FROM zakazlar WHERE chat_id=?", (chat_id,)).fetchone()["s"]
+        return {"faol": faol, "yopilgan": yopilgan, "jami_summa": summa}
 
+def get_zakaz_hisobot(chat_id, davr):
+    with get_conn() as conn:
+        f = "AND DATE(qoshildi)=DATE('now')" if davr=="bugun" else "AND strftime('%Y-%m',qoshildi)=strftime('%Y-%m','now')"
+        faollar = conn.execute(f"SELECT * FROM zakazlar WHERE chat_id=? AND holat='faol' {f}", (chat_id,)).fetchall()
+        yopilganlar = conn.execute(f"SELECT * FROM zakazlar WHERE chat_id=? AND holat='yopilgan' {f}", (chat_id,)).fetchall()
+        return {
+            "faol": len(faollar), "yopilgan": len(yopilganlar),
+            "jami_summa": sum(r["summa"] for r in faollar)+sum(r["summa"] for r in yopilganlar),
+            "yopilgan_summa": sum(r["summa"] for r in yopilganlar),
+            "faollar": [dict(r) for r in faollar],
+            "yopilganlar": [dict(r) for r in yopilganlar],
+        }
 
-# ==================== START / YORDAM ====================
+def add_prixod(chat_id, postavshik, summa, izoh, qoshgan):
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO prixodlar (chat_id, postavshik, summa, izoh, qoshgan) VALUES (?, ?, ?, ?, ?)",
+            (chat_id, postavshik, summa, izoh, qoshgan)
+        )
+        conn.commit()
+        return cur.lastrowid
+
+def get_prixod_stats(chat_id):
+    with get_conn() as conn:
+        bugun = conn.execute("SELECT COALESCE(SUM(summa),0) as s FROM prixodlar WHERE chat_id=? AND DATE(qoshildi)=DATE('now')", (chat_id,)).fetchone()["s"]
+        oylik = conn.execute("SELECT COALESCE(SUM(summa),0) as s FROM prixodlar WHERE chat_id=? AND strftime('%Y-%m',qoshildi)=strftime('%Y-%m','now')", (chat_id,)).fetchone()["s"]
+        return {"bugun": bugun, "oylik": oylik}
+
+def get_prixod_hisobot(chat_id, davr):
+    with get_conn() as conn:
+        f = "AND DATE(qoshildi)=DATE('now')" if davr=="bugun" else "AND strftime('%Y-%m',qoshildi)=strftime('%Y-%m','now')"
+        rows = conn.execute(f"SELECT * FROM prixodlar WHERE chat_id=? {f}", (chat_id,)).fetchall()
+        by_p = {}
+        for r in rows:
+            p = r["postavshik"]
+            if p not in by_p:
+                by_p[p] = {"postavshik": p, "summa": 0, "soni": 0}
+            by_p[p]["summa"] += r["summa"]
+            by_p[p]["soni"] += 1
+        return {"soni": len(rows), "summa": sum(r["summa"] for r in rows),
+                "postavshiklar": sorted(by_p.values(), key=lambda x: x["summa"], reverse=True)}
+
+def add_kassa(chat_id, tur, kim, summa, izoh, qoshgan):
+    with get_conn() as conn:
+        conn.execute("INSERT INTO kassa (chat_id, tur, kim, summa, izoh, qoshgan) VALUES (?, ?, ?, ?, ?, ?)",
+                     (chat_id, tur, kim, summa, izoh, qoshgan))
+        conn.commit()
+
+def get_kassa_balans(chat_id):
+    with get_conn() as conn:
+        k = conn.execute("SELECT COALESCE(SUM(summa),0) as s FROM kassa WHERE chat_id=? AND tur='kirim'", (chat_id,)).fetchone()["s"]
+        c = conn.execute("SELECT COALESCE(SUM(summa),0) as s FROM kassa WHERE chat_id=? AND tur='chiqim'", (chat_id,)).fetchone()["s"]
+        return k - c
+
+def get_kassa_hisobot(chat_id, davr):
+    with get_conn() as conn:
+        f = "AND DATE(qoshildi)=DATE('now')" if davr=="bugun" else "AND strftime('%Y-%m',qoshildi)=strftime('%Y-%m','now')"
+        kirimlar = conn.execute(f"SELECT * FROM kassa WHERE chat_id=? AND tur='kirim' {f}", (chat_id,)).fetchall()
+        chiqimlar = conn.execute(f"SELECT * FROM kassa WHERE chat_id=? AND tur='chiqim' {f}", (chat_id,)).fetchall()
+        k = sum(r["summa"] for r in kirimlar)
+        c = sum(r["summa"] for r in chiqimlar)
+        return {"kirim": k, "chiqim": c, "balans": k-c,
+                "kirimlar": [dict(r) for r in kirimlar],
+                "chiqimlar": [dict(r) for r in chiqimlar]}
+
+def add_ball(username, ball, sabab, admin):
+    with get_conn() as conn:
+        conn.execute("INSERT INTO balllar (username, ball, sabab, admin) VALUES (?, ?, ?, ?)",
+                     (username, ball, sabab, admin))
+        conn.commit()
+
+def get_worker_balls(username):
+    with get_conn() as conn:
+        return conn.execute("SELECT COALESCE(SUM(ball),0) as s FROM balllar WHERE LOWER(username)=LOWER(?)", (username,)).fetchone()["s"]
+
+def get_reyting():
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT username, SUM(ball) as ball FROM balllar
+            WHERE strftime('%Y-%m',qoshildi)=strftime('%Y-%m','now')
+            GROUP BY LOWER(username) ORDER BY ball DESC
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+# ===================== HELPERS =====================
+
+def is_admin(user_id): return user_id in ADMIN_IDS
+def fmt(amount): return f"{amount:,.0f} so'm"
+def now_str(): return datetime.now().strftime("%d.%m.%Y %H:%M")
+def today_str(): return date.today().strftime("%d.%m.%Y")
+
+# ===================== HANDLERS =====================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "👋 *Assalomu alaykum! Otaplama Bot!*\n\n"
-        "Bu bot quyidagi guruhlarni boshqaradi:\n\n"
-        "📦 *Zakazlar guruhi*\n"
-        "`#zakaz Ism Familiya 500000`\n"
-        "`#chiqdi Ism Familiya` — zakaz chiqdi\n\n"
-        "💰 *Prixodlar guruhi*\n"
-        "`#prixod Postavshik nomi 2000000`\n\n"
-        "🏦 *Kassa guruhi*\n"
-        "`#kirim Ism/Tashkilot 500000`\n"
-        "`#chiqim Ism/Tashkilot 300000`\n\n"
-        "⭐ *Ishchilar (faqat admin)*\n"
-        "`/ball @username 10 Yaxshi ish`\n\n"
-        "📊 *Hisobotlar*\n"
-        "`/hisobot` — bugungi hisobot\n"
-        "`/oylik` — oylik hisobot\n"
-        "`/reyting` — ishchilar reytingi\n\n"
-        "⚙️ *Admin buyruqlari*\n"
-        "`/guruh_tur` — bu guruhni sozlash\n"
+        "📦 *Zakazlar guruhi:*\n"
+        "`#zakaz Ahmad 750000 Chilonzor`\n"
+        "`#chiqdi Ahmad`\n\n"
+        "💰 *Prixodlar guruhi:*\n"
+        "`#prixod Gazprom 5000000`\n\n"
+        "🏦 *Kassa guruhi:*\n"
+        "`#kirim Alisher 1000000`\n"
+        "`#chiqim Yetkazish 50000`\n\n"
+        "⭐ *Admin:*\n"
+        "`/ball @ism 10 Sabab`\n"
+        "`/reyting`\n\n"
+        "📊 `/hisobot` `/oylik`\n"
+        "⚙️ `/guruh_tur` — guruhni sozlash"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
-
-# ==================== GURUH SOZLASH ====================
-
 async def guruh_tur(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin guruh turini belgilaydi"""
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Faqat adminlar uchun!")
+        await update.message.reply_text("Faqat adminlar uchun!")
         return
-
     chat_id = update.effective_chat.id
-    keyboard = [
-        [InlineKeyboardButton("📦 Zakazlar guruhi", callback_data=f"settype_zakazlar_{chat_id}")],
-        [InlineKeyboardButton("💰 Prixodlar guruhi", callback_data=f"settype_prixodlar_{chat_id}")],
-        [InlineKeyboardButton("🏦 Kassa guruhi", callback_data=f"settype_kassa_{chat_id}")],
-        [InlineKeyboardButton("⭐ Ishchilar guruhi", callback_data=f"settype_ishchilar_{chat_id}")],
+    kb = [
+        [InlineKeyboardButton("📦 Zakazlar", callback_data=f"st_zakazlar_{chat_id}")],
+        [InlineKeyboardButton("💰 Prixodlar", callback_data=f"st_prixodlar_{chat_id}")],
+        [InlineKeyboardButton("🏦 Kassa", callback_data=f"st_kassa_{chat_id}")],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        "Bu guruhni qaysi tur deb belgilamoqchisiz?",
-        reply_markup=reply_markup
-    )
+    await update.message.reply_text("Guruh turini tanlang:", reply_markup=InlineKeyboardMarkup(kb))
 
-async def settype_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if not is_admin(query.from_user.id):
-        await query.edit_message_text("❌ Faqat adminlar uchun!")
+async def settype_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not is_admin(q.from_user.id):
         return
-
-    parts = query.data.split("_")
-    group_type = parts[1]
+    parts = q.data.split("_")
+    tur = parts[1]
     chat_id = int(parts[2])
-
-    db.set_group_type(chat_id, group_type)
-    type_name = GROUP_TYPES.get(group_type, group_type)
-    await query.edit_message_text(f"✅ Guruh turi: *{type_name}* deb belgilandi!", parse_mode="Markdown")
-
-
-# ==================== XABARLARNI TAHLIL QILISH ====================
+    set_group_type(chat_id, tur)
+    names = {"zakazlar": "📦 Zakazlar", "prixodlar": "💰 Prixodlar", "kassa": "🏦 Kassa"}
+    await q.edit_message_text(f"✅ Guruh: *{names.get(tur, tur)}* deb belgilandi!", parse_mode="Markdown")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
-
     chat_id = update.effective_chat.id
     user = update.effective_user
     text = update.message.text.strip()
+    tur = get_group_type(chat_id)
+    if tur == "zakazlar":
+        await handle_zakaz(update, text, user, chat_id)
+    elif tur == "prixodlar":
+        await handle_prixod(update, text, user, chat_id)
+    elif tur == "kassa":
+        await handle_kassa(update, text, user, chat_id)
 
-    group_type = db.get_group_type(chat_id)
-
-    if group_type == "zakazlar":
-        await handle_zakaz(update, context, text, user, chat_id)
-    elif group_type == "prixodlar":
-        await handle_prixod(update, context, text, user, chat_id)
-    elif group_type == "kassa":
-        await handle_kassa(update, context, text, user, chat_id)
-
-
-# ==================== ZAKAZLAR ====================
-
-async def handle_zakaz(update, context, text, user, chat_id):
-    """
-    Formatlar:
-    #zakaz Ism Familiya 500000 [Obyekt nomi]
-    #chiqdi Ism Familiya
-    #bekor Ism Familiya
-    """
-    # Yangi zakaz: #zakaz Ahmad Karimov 750000 Chilonzor
-    zakaz_match = re.match(
-        r'#zakaz\s+(.+?)\s+([\d\s]+)\s*(.*)$', text, re.IGNORECASE
-    )
-    if zakaz_match:
-        mijoz = zakaz_match.group(1).strip()
-        summa_str = zakaz_match.group(2).replace(" ", "")
-        obyekt = zakaz_match.group(3).strip() or "—"
-
-        try:
-            summa = float(summa_str)
-        except ValueError:
-            await update.message.reply_text("❌ Summa noto'g'ri formatda!")
-            return
-
-        zakaz_id = db.add_zakaz(
-            chat_id=chat_id,
-            mijoz=mijoz,
-            summa=summa,
-            obyekt=obyekt,
-            qoshgan=f"{user.first_name} {user.last_name or ''}".strip()
-        )
-
-        stats = db.get_zakaz_stats(chat_id)
-        reply = (
-            f"✅ *Yangi zakaz #{zakaz_id} qo'shildi!*\n\n"
-            f"👤 Mijoz: *{mijoz}*\n"
-            f"💵 Summa: *{format_money(summa)}*\n"
-            f"🏠 Obyekt: *{obyekt}*\n"
-            f"📅 Sana: {now_str()}\n\n"
-            f"📊 *Jami holat:*\n"
-            f"  🟢 Faol zakazlar: {stats['faol']}\n"
-            f"  ✅ Yopilgan: {stats['yopilgan']}\n"
-            f"  💰 Jami summa: {format_money(stats['jami_summa'])}"
-        )
-        await update.message.reply_text(reply, parse_mode="Markdown")
-        return
-
-    # Zakaz chiqdi: #chiqdi Ahmad Karimov
-    chiqdi_match = re.match(r'#chiqdi\s+(.+)$', text, re.IGNORECASE)
-    if chiqdi_match:
-        mijoz = chiqdi_match.group(1).strip()
-        result = db.close_zakaz(chat_id, mijoz)
-
-        if result:
-            stats = db.get_zakaz_stats(chat_id)
-            reply = (
-                f"✅ *Zakaz yopildi!*\n\n"
-                f"👤 Mijoz: *{result['mijoz']}*\n"
-                f"💵 Summa: *{format_money(result['summa'])}*\n"
-                f"🏠 Obyekt: *{result['obyekt']}*\n"
-                f"📅 Yopildi: {now_str()}\n\n"
-                f"📊 *Jami:* {stats['faol']} faol | {stats['yopilgan']} yopilgan"
-            )
-        else:
-            reply = f"❌ *{mijoz}* nomli faol zakaz topilmadi!"
-
-        await update.message.reply_text(reply, parse_mode="Markdown")
-        return
-
-
-# ==================== PRIXODLAR ====================
-
-async def handle_prixod(update, context, text, user, chat_id):
-    """
-    #prixod PostavshikNomi 2000000 [Izoh]
-    """
-    match = re.match(r'#prixod\s+(.+?)\s+([\d\s]+)\s*(.*)$', text, re.IGNORECASE)
-    if not match:
-        return
-
-    postavshik = match.group(1).strip()
-    summa_str = match.group(2).replace(" ", "")
-    izoh = match.group(3).strip() or "—"
-
-    try:
-        summa = float(summa_str)
-    except ValueError:
-        await update.message.reply_text("❌ Summa noto'g'ri!")
-        return
-
-    prixod_id = db.add_prixod(
-        chat_id=chat_id,
-        postavshik=postavshik,
-        summa=summa,
-        izoh=izoh,
-        qoshgan=f"{user.first_name} {user.last_name or ''}".strip()
-    )
-
-    stats = db.get_prixod_stats(chat_id)
-    reply = (
-        f"📦 *Yangi prixod #{prixod_id}!*\n\n"
-        f"🏭 Postavshik: *{postavshik}*\n"
-        f"💵 Summa: *{format_money(summa)}*\n"
-        f"📝 Izoh: {izoh}\n"
-        f"📅 Sana: {now_str()}\n\n"
-        f"📊 *Bugungi prixodlar:* {format_money(stats['bugun'])}\n"
-        f"📅 *Bu oylik jami:* {format_money(stats['oylik'])}"
-    )
-    await update.message.reply_text(reply, parse_mode="Markdown")
-
-
-# ==================== KASSA ====================
-
-async def handle_kassa(update, context, text, user, chat_id):
-    """
-    #kirim Ism/Tashkilot 500000 [Izoh]
-    #chiqim Ism/Tashkilot 300000 [Izoh]
-    """
-    kirim_match = re.match(r'#kirim\s+(.+?)\s+([\d\s]+)\s*(.*)$', text, re.IGNORECASE)
-    chiqim_match = re.match(r'#chiqim\s+(.+?)\s+([\d\s]+)\s*(.*)$', text, re.IGNORECASE)
-
-    match = kirim_match or chiqim_match
-    if not match:
-        return
-
-    tur = "kirim" if kirim_match else "chiqim"
-    kim = match.group(1).strip()
-    summa_str = match.group(2).replace(" ", "")
-    izoh = match.group(3).strip() or "—"
-
-    try:
-        summa = float(summa_str)
-    except ValueError:
-        await update.message.reply_text("❌ Summa noto'g'ri!")
-        return
-
-    db.add_kassa(
-        chat_id=chat_id,
-        tur=tur,
-        kim=kim,
-        summa=summa,
-        izoh=izoh,
-        qoshgan=f"{user.first_name} {user.last_name or ''}".strip()
-    )
-
-    balans = db.get_kassa_balans(chat_id)
-    emoji = "💚" if tur == "kirim" else "🔴"
-    arrow = "⬆️" if tur == "kirim" else "⬇️"
-
-    reply = (
-        f"{emoji} *Kassa {tur.upper()}!*\n\n"
-        f"👤 Kim: *{kim}*\n"
-        f"{arrow} Summa: *{format_money(summa)}*\n"
-        f"📝 Izoh: {izoh}\n"
-        f"📅 Sana: {now_str()}\n\n"
-        f"💰 *Joriy balans: {format_money(balans)}*"
-    )
-    await update.message.reply_text(reply, parse_mode="Markdown")
-
-
-# ==================== BALL BERISH (ADMIN) ====================
-
-async def ball_ber(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /ball @username 10 Yaxshi ish bajardi
-    """
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Faqat adminlar uchun!")
-        return
-
-    args = context.args
-    if len(args) < 2:
+async def handle_zakaz(update, text, user, chat_id):
+    m = re.match(r'#zakaz\s+(.+?)\s+([\d]+)\s*(.*)', text, re.IGNORECASE)
+    if m:
+        mijoz, summa, obyekt = m.group(1).strip(), float(m.group(2)), m.group(3).strip() or "-"
+        zid = add_zakaz(chat_id, mijoz, summa, obyekt, user.first_name)
+        s = get_zakaz_stats(chat_id)
         await update.message.reply_text(
-            "📝 Format: `/ball @username 10 Sabab`",
+            f"✅ *Zakaz #{zid} qo'shildi!*\n👤 {mijoz}\n💵 {fmt(summa)}\n🏠 {obyekt}\n\n"
+            f"🟢 Faol: {s['faol']} | ✅ Yopilgan: {s['yopilgan']}",
             parse_mode="Markdown"
         )
         return
+    m = re.match(r'#chiqdi\s+(.+)', text, re.IGNORECASE)
+    if m:
+        r = close_zakaz(chat_id, m.group(1).strip())
+        if r:
+            s = get_zakaz_stats(chat_id)
+            await update.message.reply_text(
+                f"✅ *Zakaz yopildi!*\n👤 {r['mijoz']}\n💵 {fmt(r['summa'])}\n🏠 {r['obyekt']}\n\n"
+                f"🟢 Faol: {s['faol']} | ✅ Yopilgan: {s['yopilgan']}",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(f"❌ Faol zakaz topilmadi!")
 
+async def handle_prixod(update, text, user, chat_id):
+    m = re.match(r'#prixod\s+(.+?)\s+([\d]+)\s*(.*)', text, re.IGNORECASE)
+    if not m:
+        return
+    postavshik, summa, izoh = m.group(1).strip(), float(m.group(2)), m.group(3).strip() or "-"
+    pid = add_prixod(chat_id, postavshik, summa, izoh, user.first_name)
+    s = get_prixod_stats(chat_id)
+    await update.message.reply_text(
+        f"📦 *Prixod #{pid}!*\n🏭 {postavshik}\n💵 {fmt(summa)}\n\n"
+        f"📅 Bugun: {fmt(s['bugun'])} | Oy: {fmt(s['oylik'])}",
+        parse_mode="Markdown"
+    )
+
+async def handle_kassa(update, text, user, chat_id):
+    mk = re.match(r'#kirim\s+(.+?)\s+([\d]+)\s*(.*)', text, re.IGNORECASE)
+    mc = re.match(r'#chiqim\s+(.+?)\s+([\d]+)\s*(.*)', text, re.IGNORECASE)
+    m = mk or mc
+    if not m:
+        return
+    tur = "kirim" if mk else "chiqim"
+    kim, summa, izoh = m.group(1).strip(), float(m.group(2)), m.group(3).strip() or "-"
+    add_kassa(chat_id, tur, kim, summa, izoh, user.first_name)
+    balans = get_kassa_balans(chat_id)
+    e = "💚" if tur == "kirim" else "🔴"
+    await update.message.reply_text(
+        f"{e} *Kassa {tur.upper()}!*\n👤 {kim}\n💵 {fmt(summa)}\n\n💰 Balans: {fmt(balans)}",
+        parse_mode="Markdown"
+    )
+
+async def ball_ber(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("Format: `/ball @username 10 Sabab`", parse_mode="Markdown")
+        return
     username = args[0].lstrip("@")
     try:
         ball = int(args[1])
-    except ValueError:
-        await update.message.reply_text("❌ Ball raqam bo'lishi kerak!")
+    except:
+        await update.message.reply_text("Ball raqam bo'lishi kerak!")
         return
-
-    sabab = " ".join(args[2:]) if len(args) > 2 else "—"
-
-    db.add_ball(
-        username=username,
-        ball=ball,
-        sabab=sabab,
-        admin=f"{update.effective_user.first_name}"
-    )
-
-    jami = db.get_worker_balls(username)
+    sabab = " ".join(args[2:]) if len(args) > 2 else "-"
+    add_ball(username, ball, sabab, update.effective_user.first_name)
+    jami = get_worker_balls(username)
     sign = "+" if ball > 0 else ""
-    reply = (
-        f"⭐ *Ball berildi!*\n\n"
-        f"👤 Ishchi: @{username}\n"
-        f"🎯 Ball: *{sign}{ball}*\n"
-        f"📝 Sabab: {sabab}\n"
-        f"📊 Jami ball: *{jami}*"
+    await update.message.reply_text(
+        f"⭐ *Ball berildi!*\n👤 @{username}\n🎯 {sign}{ball} ball\n📝 {sabab}\n📊 Jami: {jami}",
+        parse_mode="Markdown"
     )
-    await update.message.reply_text(reply, parse_mode="Markdown")
-
-
-# ==================== HISOBOTLAR ====================
 
 async def hisobot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Bugungi hisobot"""
-    chat_id = update.effective_chat.id
-    group_type = db.get_group_type(chat_id)
-
-    if group_type == "zakazlar":
-        await zakaz_hisobot(update, chat_id, "bugun")
-    elif group_type == "prixodlar":
-        await prixod_hisobot(update, chat_id, "bugun")
-    elif group_type == "kassa":
-        await kassa_hisobot(update, chat_id, "bugun")
-    else:
-        await update.message.reply_text(
-            "❗ Bu guruh hali sozlanmagan.\n"
-            "Admin `/guruh_tur` buyrug'ini ishlatsin.",
-            parse_mode="Markdown"
-        )
+    await _hisobot(update, "bugun")
 
 async def oylik(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Oylik hisobot"""
+    await _hisobot(update, "oy")
+
+async def _hisobot(update, davr):
     chat_id = update.effective_chat.id
-    group_type = db.get_group_type(chat_id)
+    tur = get_group_type(chat_id)
+    davr_text = "Bugungi" if davr == "bugun" else "Oylik"
 
-    if group_type == "zakazlar":
-        await zakaz_hisobot(update, chat_id, "oy")
-    elif group_type == "prixodlar":
-        await prixod_hisobot(update, chat_id, "oy")
-    elif group_type == "kassa":
-        await kassa_hisobot(update, chat_id, "oy")
+    if tur == "zakazlar":
+        d = get_zakaz_hisobot(chat_id, davr)
+        text = f"📦 *{davr_text} Zakazlar*\n🗓 {today_str()}\n━━━━━━━━━\n"
+        text += f"🟢 Faol: {d['faol']} | ✅ Yopilgan: {d['yopilgan']}\n"
+        text += f"💰 Jami: {fmt(d['jami_summa'])}\n"
+        if d['yopilganlar']:
+            text += "\n✅ *Yopilganlar:*\n"
+            for z in d['yopilganlar']:
+                text += f"  • {z['mijoz']} — {fmt(z['summa'])}\n"
+        if d['faollar']:
+            text += "\n🟢 *Faollar:*\n"
+            for z in d['faollar']:
+                text += f"  • {z['mijoz']} — {fmt(z['summa'])}\n"
+
+    elif tur == "prixodlar":
+        d = get_prixod_hisobot(chat_id, davr)
+        text = f"💰 *{davr_text} Prixodlar*\n🗓 {today_str()}\n━━━━━━━━━\n"
+        text += f"📦 Soni: {d['soni']} ta | 💵 {fmt(d['summa'])}\n"
+        if d['postavshiklar']:
+            text += "\n🏭 *Postavshiklar:*\n"
+            for p in d['postavshiklar']:
+                text += f"  • {p['postavshik']}: {fmt(p['summa'])}\n"
+
+    elif tur == "kassa":
+        d = get_kassa_hisobot(chat_id, davr)
+        text = f"🏦 *{davr_text} Kassa*\n🗓 {today_str()}\n━━━━━━━━━\n"
+        text += f"💚 Kirim: {fmt(d['kirim'])}\n🔴 Chiqim: {fmt(d['chiqim'])}\n💰 Balans: {fmt(d['balans'])}\n"
+        if d['kirimlar']:
+            text += "\n💚 *Kirimlar:*\n"
+            for k in d['kirimlar']:
+                text += f"  • {k['kim']}: {fmt(k['summa'])}\n"
+        if d['chiqimlar']:
+            text += "\n🔴 *Chiqimlar:*\n"
+            for c in d['chiqimlar']:
+                text += f"  • {c['kim']}: {fmt(c['summa'])}\n"
     else:
-        await update.message.reply_text("❗ Guruh sozlanmagan!")
-
-async def zakaz_hisobot(update, chat_id, davr):
-    data = db.get_zakaz_hisobot(chat_id, davr)
-    davr_text = "📅 Bugungi" if davr == "bugun" else "📆 Oylik"
-
-    text = f"📦 *{davr_text} Zakazlar Hisoboti*\n"
-    text += f"🗓 {today_str()}\n"
-    text += "━━━━━━━━━━━━━━━\n\n"
-    text += f"🟢 Faol zakazlar: *{data['faol']}*\n"
-    text += f"✅ Yopilgan: *{data['yopilgan']}*\n"
-    text += f"💰 Jami summa: *{format_money(data['jami_summa'])}*\n"
-    text += f"💵 Yopilgan summa: *{format_money(data['yopilgan_summa'])}*\n\n"
-
-    if data['yopilganlar']:
-        text += "✅ *Yopilgan zakazlar:*\n"
-        for z in data['yopilganlar']:
-            text += f"  • {z['mijoz']} — {format_money(z['summa'])} | {z['obyekt']}\n"
-
-    if data['faollar']:
-        text += "\n🟢 *Faol zakazlar:*\n"
-        for z in data['faollar']:
-            text += f"  • {z['mijoz']} — {format_money(z['summa'])} | {z['obyekt']}\n"
+        text = "❗ Guruh sozlanmagan. Admin `/guruh_tur` bossin."
 
     await update.message.reply_text(text, parse_mode="Markdown")
-
-async def prixod_hisobot(update, chat_id, davr):
-    data = db.get_prixod_hisobot(chat_id, davr)
-    davr_text = "📅 Bugungi" if davr == "bugun" else "📆 Oylik"
-
-    text = f"💰 *{davr_text} Prixodlar Hisoboti*\n"
-    text += f"🗓 {today_str()}\n"
-    text += "━━━━━━━━━━━━━━━\n\n"
-    text += f"📦 Jami prixodlar: *{data['soni']} ta*\n"
-    text += f"💵 Jami summa: *{format_money(data['summa'])}*\n\n"
-
-    if data['postavshiklar']:
-        text += "🏭 *Postavshiklar bo'yicha:*\n"
-        for p in data['postavshiklar']:
-            text += f"  • {p['postavshik']}: *{format_money(p['summa'])}* ({p['soni']} ta)\n"
-
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-async def kassa_hisobot(update, chat_id, davr):
-    data = db.get_kassa_hisobot(chat_id, davr)
-    davr_text = "📅 Bugungi" if davr == "bugun" else "📆 Oylik"
-
-    text = f"🏦 *{davr_text} Kassa Hisoboti*\n"
-    text += f"🗓 {today_str()}\n"
-    text += "━━━━━━━━━━━━━━━\n\n"
-    text += f"💚 Kirim: *{format_money(data['kirim'])}*\n"
-    text += f"🔴 Chiqim: *{format_money(data['chiqim'])}*\n"
-    text += f"💰 Balans: *{format_money(data['balans'])}*\n\n"
-
-    if data['kirimlar']:
-        text += "💚 *Kirimlar:*\n"
-        for k in data['kirimlar']:
-            text += f"  • {k['kim']}: {format_money(k['summa'])}\n"
-
-    if data['chiqimlar']:
-        text += "\n🔴 *Chiqimlar:*\n"
-        for c in data['chiqimlar']:
-            text += f"  • {c['kim']}: {format_money(c['summa'])}\n"
-
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-
-# ==================== REYTING ====================
 
 async def reyting(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ishchilar reytingi"""
-    workers = db.get_reyting()
-
+    workers = get_reyting()
     if not workers:
-        await update.message.reply_text("📊 Hali ball berilmagan!")
+        await update.message.reply_text("Hali ball berilmagan!")
         return
-
     medals = ["🥇", "🥈", "🥉"]
-    text = "⭐ *Ishchilar Reytingi*\n"
-    text += f"📅 {datetime.now().strftime('%B %Y')}\n"
-    text += "━━━━━━━━━━━━━━━\n\n"
-
+    text = f"⭐ *Ishchilar Reytingi*\n🗓 {datetime.now().strftime('%B %Y')}\n━━━━━━━━━\n\n"
     for i, w in enumerate(workers):
-        medal = medals[i] if i < 3 else f"{i+1}."
-        text += f"{medal} @{w['username']} — *{w['ball']} ball*\n"
-
-    oy = datetime.now().strftime("%B %Y")
-    text += f"\n🏆 *{oy} g'olibi:* @{workers[0]['username']}"
-
+        m = medals[i] if i < 3 else f"{i+1}."
+        text += f"{m} @{w['username']} — *{w['ball']} ball*\n"
     await update.message.reply_text(text, parse_mode="Markdown")
 
-
-# ==================== UMUMIY STATISTIKA ====================
-
-async def umumiy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Barcha guruhlar bo'yicha umumiy statistika (faqat admin)"""
-    if not is_admin(update.effective_user.id):
-        return
-
-    stats = db.get_umumiy_stats()
-    text = (
-        f"📊 *Umumiy Statistika*\n"
-        f"🗓 {today_str()}\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        f"📦 Zakazlar: {stats['zakaz_faol']} faol / {stats['zakaz_yopilgan']} yopilgan\n"
-        f"💰 Zakazlar summasi: *{format_money(stats['zakaz_summa'])}*\n\n"
-        f"📦 Prixodlar (oy): *{format_money(stats['prixod_oy'])}*\n\n"
-        f"🏦 Kassa balansi: *{format_money(stats['kassa_balans'])}*\n"
-        f"  💚 Kirim: {format_money(stats['kassa_kirim'])}\n"
-        f"  🔴 Chiqim: {format_money(stats['kassa_chiqim'])}\n"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-
-# ==================== MAIN ====================
+# ===================== MAIN =====================
 
 def main():
+    init_db()
     app = Application.builder().token(BOT_TOKEN).build()
-
-    # Buyruqlar
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("guruh_tur", guruh_tur))
     app.add_handler(CommandHandler("ball", ball_ber))
     app.add_handler(CommandHandler("hisobot", hisobot))
     app.add_handler(CommandHandler("oylik", oylik))
     app.add_handler(CommandHandler("reyting", reyting))
-    app.add_handler(CommandHandler("umumiy", umumiy))
-
-    # Callback
-    app.add_handler(CallbackQueryHandler(settype_callback, pattern=r"^settype_"))
-
-    # Xabarlar
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        handle_message
-    ))
-
-    logger.info("🚀 Otaplama Bot ishga tushdi!")
+    app.add_handler(CallbackQueryHandler(settype_cb, pattern=r"^st_"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    logger.info("Bot ishga tushdi!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
